@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { ApiHandler, ApiStreamChunk } from "@cline/llms";
 import { ProviderSettingsManager } from "@cline/core";
 import { detectClineInstall } from "./cline-detection.js";
 import { ProxyError } from "./errors.js";
 import { createHandlerForModel } from "./handler.js";
 import { loadModelCatalog, resolveModelRef, type ModelCatalog } from "./models.js";
+import { toOpenAIToolCall, type OpenAIToolCallOut } from "./tools-out.js";
 import { translateRequest, type ChatCompletionRequest } from "./translate.js";
 
 export interface ProxyServerOptions {
@@ -64,6 +66,15 @@ interface CompletionContext {
 	coreVersion: string;
 }
 
+interface StreamResult {
+	text: string;
+	toolCalls: OpenAIToolCallOut[];
+	promptTokens: number;
+	completionTokens: number;
+	totalCost?: number;
+	failed?: string;
+}
+
 function modelsPayload(catalog: ModelCatalog): unknown {
 	return {
 		object: "list",
@@ -74,6 +85,85 @@ function modelsPayload(catalog: ModelCatalog): unknown {
 			owned_by: model.providerId,
 		})),
 	};
+}
+
+/**
+ * Validate `tool_choice` against the declared tools. The provider layer has
+ * no forced-tool mode, so a named choice is accepted (but behaves like auto);
+ * an unknown name or a wrong-typed value is a 400.
+ */
+function validateToolChoice(body: ChatCompletionRequest): void {
+	const choice = body.tool_choice;
+	if (choice === undefined || choice === "auto" || choice === "none" || choice === "required") {
+		return;
+	}
+	if (typeof choice === "object" && choice !== null) {
+		const name = choice.function?.name;
+		const declared = new Set<string>();
+		for (const tool of body.tools ?? []) {
+			if (tool?.function?.name) {
+				declared.add(tool.function.name);
+			}
+		}
+		for (const fn of body.functions ?? []) {
+			if (fn?.name) {
+				declared.add(fn.name);
+			}
+		}
+		if (name && !declared.has(name)) {
+			throw new ProxyError(400, `tool_choice names unknown tool ${JSON.stringify(name)}.`);
+		}
+		return;
+	}
+	throw new ProxyError(400, '`tool_choice` must be "auto", "none", "required", or { "type": "function", "function": { "name": ... } }.');
+}
+
+function validateNoLegacyFunctionCall(body: ChatCompletionRequest): void {
+	if (body.function_call !== undefined) {
+		throw new ProxyError(400, "Legacy `function_call` is not supported: send `tool_calls` instead.");
+	}
+}
+
+/**
+ * Run one provider stream to completion, collecting text, tool calls, and
+ * usage. The caller owns the tool loop: tool calls are returned, never
+ * executed — the client executes them and sends results back as `tool`
+ * messages on the next request.
+ */
+async function streamOnce(
+	handler: ApiHandler,
+	systemPrompt: string,
+	messages: Parameters<ApiHandler["createMessage"]>[1],
+	tools: Parameters<ApiHandler["createMessage"]>[2],
+	signal: AbortSignal,
+): Promise<StreamResult> {
+	let text = "";
+	const toolCalls: OpenAIToolCallOut[] = [];
+	let promptTokens = 0;
+	let completionTokens = 0;
+	let totalCost: number | undefined;
+	let failed: string | undefined;
+	const stream: AsyncGenerator<ApiStreamChunk> = handler.createMessage(systemPrompt, messages, tools);
+	for await (const chunk of stream) {
+		if (signal.aborted) {
+			break;
+		}
+		if (chunk.type === "text") {
+			text += chunk.text;
+		} else if (chunk.type === "tool_calls") {
+			toolCalls.push(toOpenAIToolCall(chunk, `call_${toolCalls.length}`));
+		} else if (chunk.type === "usage") {
+			promptTokens = chunk.inputTokens;
+			completionTokens = chunk.outputTokens;
+			totalCost = chunk.totalCost;
+		} else if (chunk.type === "done" && !chunk.success && !text && toolCalls.length === 0) {
+			failed = chunk.error ?? "Provider stream failed.";
+		}
+	}
+	if (failed) {
+		throw new Error(failed);
+	}
+	return { text, toolCalls, promptTokens, completionTokens, ...(totalCost !== undefined ? { totalCost } : {}) };
 }
 
 async function handleChatCompletions(
@@ -88,8 +178,11 @@ async function handleChatCompletions(
 		sendError(res, error instanceof ProxyError ? error.status : 400, "Request body must be valid JSON.");
 		return;
 	}
-	if (body.tools !== undefined || body.functions !== undefined || body.tool_choice !== undefined) {
-		sendError(res, 400, "Tool calling is not supported by cline-proxy: it runs without tools (no tool loop).");
+	try {
+		validateToolChoice(body);
+		validateNoLegacyFunctionCall(body);
+	} catch (error) {
+		sendError(res, error instanceof ProxyError ? error.status : 400, error instanceof Error ? error.message : "Invalid request.");
 		return;
 	}
 	let translated;
@@ -131,26 +224,15 @@ async function handleChatCompletions(
 	const openAiModel = `${handlerResult.providerId}/${handlerResult.modelId}`;
 
 	if (!body.stream) {
-		let text = "";
-		let promptTokens = 0;
-		let completionTokens = 0;
-		let totalCost: number | undefined;
+		let result: StreamResult;
 		try {
-			const stream = handlerResult.handler.createMessage(translated.systemPrompt, translated.messages);
-			for await (const chunk of stream) {
-				if (controller.signal.aborted) {
-					break;
-				}
-				if (chunk.type === "text") {
-					text += chunk.text;
-				} else if (chunk.type === "usage") {
-					promptTokens = chunk.inputTokens;
-					completionTokens = chunk.outputTokens;
-					totalCost = chunk.totalCost;
-				} else if (chunk.type === "done" && !chunk.success && !text) {
-					throw new Error(chunk.error ?? "Provider stream failed.");
-				}
-			}
+			result = await streamOnce(
+				handlerResult.handler,
+				translated.systemPrompt,
+				translated.messages,
+				translated.tools,
+				controller.signal,
+			);
 		} catch (error) {
 			if (controller.signal.aborted) {
 				return;
@@ -158,6 +240,7 @@ async function handleChatCompletions(
 			sendError(res, 502, error instanceof Error ? error.message : "Provider request failed.", "provider_error");
 			return;
 		}
+		const hasTools = result.toolCalls.length > 0;
 		sendJson(res, 200, {
 			id: completionId,
 			object: "chat.completion",
@@ -166,14 +249,24 @@ async function handleChatCompletions(
 			choices: [
 				{
 					index: 0,
-					message: { role: "assistant", content: text },
-					finish_reason: "stop",
+					message: {
+						role: "assistant",
+						content: hasTools && !result.text ? null : result.text,
+						...(hasTools ? { tool_calls: result.toolCalls } : {}),
+					},
+					finish_reason: hasTools ? "tool_calls" : "stop",
 				},
 			],
-			...(promptTokens || completionTokens
-				? { usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens } }
+			...(result.promptTokens || result.completionTokens
+				? {
+						usage: {
+							prompt_tokens: result.promptTokens,
+							completion_tokens: result.completionTokens,
+							total_tokens: result.promptTokens + result.completionTokens,
+						},
+					}
 				: {}),
-			...(totalCost !== undefined ? { cost: totalCost } : {}),
+			...(result.totalCost !== undefined ? { cost: result.totalCost } : {}),
 		});
 		return;
 	}
@@ -195,8 +288,13 @@ async function handleChatCompletions(
 	const clientClosed = new Promise<void>((resolve) => req.on("close", resolve));
 	try {
 		sendChunk({ ...baseChunk(), choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-		const stream = handlerResult.handler.createMessage(translated.systemPrompt, translated.messages);
+		const stream = handlerResult.handler.createMessage(
+			translated.systemPrompt,
+			translated.messages,
+			translated.tools,
+		);
 		let usage: { promptTokens: number; completionTokens: number } | undefined;
+		const toolCalls: OpenAIToolCallOut[] = [];
 		let failed: string | undefined;
 		const consume = (async (): Promise<void> => {
 			for await (const chunk of stream) {
@@ -208,6 +306,8 @@ async function handleChatCompletions(
 						...baseChunk(),
 						choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }],
 					});
+				} else if (chunk.type === "tool_calls") {
+					toolCalls.push(toOpenAIToolCall(chunk, `call_${toolCalls.length}`));
 				} else if (chunk.type === "usage") {
 					usage = { promptTokens: chunk.inputTokens, completionTokens: chunk.outputTokens };
 				} else if (chunk.type === "done" && !chunk.success) {
@@ -221,17 +321,38 @@ async function handleChatCompletions(
 			return;
 		}
 		await consume;
-		if (failed) {
+		if (failed && toolCalls.length === 0) {
 			sendChunk({
 				...baseChunk(),
 				choices: [{ index: 0, delta: {}, finish_reason: "error" }],
 				error: { message: failed },
 			});
 		} else {
+			toolCalls.forEach((call, index) => {
+				sendChunk({
+					...baseChunk(),
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{
+										index,
+										id: call.id,
+										type: "function",
+										function: { name: call.function.name, arguments: call.function.arguments },
+									},
+								],
+							},
+							finish_reason: null,
+						},
+					],
+				});
+			});
 			const includeUsage = body.stream_options?.include_usage === true;
 			sendChunk({
 				...baseChunk(),
-				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				choices: [{ index: 0, delta: {}, finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop" }],
 				...(includeUsage && usage
 					? {
 							usage: {

@@ -5,8 +5,13 @@ A local OpenAI-compatible HTTP server that routes chat requests through your
 at it and use the models Cline is configured to use — with Cline's headers
 (`User-Agent: Cline/…`, `X-CLIENT-*`, `X-Title`, billing headers, …).
 
-- No tool loop: requests containing `tools`/`functions`/`tool_choice` and
-  `tool`/`function` messages are rejected with HTTP 400.
+- Tool calling: `tools`/`functions` are passed through to the provider and
+  stream back as OpenAI-style `tool_calls` (`finish_reason: "tool_calls"`).
+  The client owns the tool loop — execute tools yourself and send results
+  back as `tool` messages with `tool_call_id`. (The proxy never executes
+  tools.) `tool_choice` accepts `"auto"`/`"none"`/`"required"` or a named
+  `{"type": "function", "function": {"name": ...}}`; legacy `function_call`
+  and `function` messages are rejected with HTTP 400.
 - Models are addressed as `"providerId/model-slug"`
   (e.g. `"anthropic/claude-sonnet-5"`). A bare model id resolves against the
   served catalog; omitting `model` uses your Cline default.
@@ -61,6 +66,38 @@ completion = client.chat.completions.create(
 )
 for chunk in completion:
     print(chunk.choices[0].delta.content or "", end="")
+
+# With tools (client owns the loop):
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    },
+}]
+first = client.chat.completions.create(
+    model="anthropic/claude-sonnet-5",
+    messages=[{"role": "user", "content": "Weather in Paris?"}],
+    tools=tools,
+)
+msg = first.choices[0].message
+if msg.tool_calls:
+    results = [{"role": "tool", "tool_call_id": c.id, "content": "sunny, 21C"}
+               for c in msg.tool_calls]
+    second = client.chat.completions.create(
+        model="anthropic/claude-sonnet-5",
+        messages=[
+            {"role": "user", "content": "Weather in Paris?"},
+            {"role": "assistant", "content": msg.content, "tool_calls": [
+                {"id": c.id, "type": "function",
+                 "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                for c in msg.tool_calls]},
+            *results,
+        ],
+        tools=tools,
+    )
+    print(second.choices[0].message.content)
 ```
 
 Node.js:
@@ -96,9 +133,11 @@ stored Cline settings for that call only.
    model → Cline billing headers via `resolveProviderRequestHeaders`
    (from `@cline/llms`, `source: "proxy"`, `client: cline-proxy`) →
    `createHandlerAsync(config)` → `handler.createMessage(systemPrompt,
-   messages)` with **no tools**.
-4. Translates the resulting `ApiStream` (`text`/`usage` chunks) into
-   OpenAI response shapes.
+   messages, tools)` — tools become Cline `ToolDefinition`s.
+4. Translates the resulting `ApiStream` (`text`/`tool_calls`/`usage` chunks)
+   into OpenAI response shapes (`finish_reason: "tool_calls"` when the model
+   calls tools). Tool results come back as `tool` messages on the next
+   request; the proxy never executes tools itself.
 
 ## Develop
 

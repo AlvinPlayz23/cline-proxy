@@ -32,7 +32,8 @@ CLINE_DATA_DIR, CLINE_PROVIDER_SETTINGS_PATH env vars honored), then serves:
   POST /v1/chat/completions   (OpenAI-compatible, stream + non-stream)
 
 Use models as "providerId/model-slug", e.g. "anthropic/claude-sonnet-5".
-No tools: requests containing tools/functions are rejected.`);
+Tools are passed through to the provider (OpenAI-compatible tool_calls);
+the client owns the tool loop — the proxy never executes tools.`);
 }
 
 async function main(): Promise<number> {
