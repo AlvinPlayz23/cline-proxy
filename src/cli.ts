@@ -25,11 +25,17 @@ function printHelp(): void {
 Usage:
   cline-proxy serve [--port 18789] [--host 127.0.0.1] [--cline-dir PATH]
                     [--data-dir PATH] [--providers-path PATH]
+                    [--no-ui] [--log-limit N] [--log-file PATH]
 
 Detects your Cline installation (~/.cline by default; CLINE_DIR,
 CLINE_DATA_DIR, CLINE_PROVIDER_SETTINGS_PATH env vars honored), then serves:
   GET  /v1/models
   POST /v1/chat/completions   (OpenAI-compatible, stream + non-stream)
+  GET  /ui                    (web inspector: every request, prompt, tool call
+                               and response; disable with --no-ui)
+
+Inspector: keeps the last --log-limit requests in memory (default 200).
+--log-file PATH also appends them to a JSONL file (full prompts — keep it private).
 
 Use models as "providerId/model-slug", e.g. "anthropic/claude-sonnet-5".
 Tools are passed through to the provider (OpenAI-compatible tool_calls);
@@ -53,6 +59,13 @@ async function main(): Promise<number> {
 		console.error(`Invalid --port: ${JSON.stringify(portRaw)}.`);
 		return 1;
 	}
+	const host = argValue("host") ?? process.env.CLINE_PROXY_HOST ?? "127.0.0.1";
+	const logLimitRaw = argValue("log-limit") ?? process.env.CLINE_PROXY_LOG_LIMIT;
+	const logLimit = logLimitRaw ? Number.parseInt(logLimitRaw, 10) : undefined;
+	if (logLimit !== undefined && (!Number.isInteger(logLimit) || logLimit <= 0)) {
+		console.error(`Invalid --log-limit: ${JSON.stringify(logLimitRaw)}.`);
+		return 1;
+	}
 	const install = detectClineInstall({
 		clineDir: argValue("cline-dir"),
 		dataDir: argValue("data-dir"),
@@ -66,11 +79,14 @@ async function main(): Promise<number> {
 	}
 	try {
 		const proxy = await startProxyServer({
-			host: argValue("host") ?? process.env.CLINE_PROXY_HOST ?? "127.0.0.1",
+			host,
 			port,
 			clineDir: argValue("cline-dir"),
 			dataDir: argValue("data-dir"),
 			providersPath: argValue("providers-path"),
+			ui: !hasFlag("--no-ui") && process.env.CLINE_PROXY_UI !== "0",
+			logLimit,
+			logFile: argValue("log-file") ?? process.env.CLINE_PROXY_LOG_FILE,
 		});
 		console.log(`cline-proxy listening on ${proxy.url}`);
 		console.log(`Cline settings: ${proxy.settingsPath}`);
@@ -79,6 +95,12 @@ async function main(): Promise<number> {
 			console.log(`Default model: ${proxy.catalog.defaultModel}`);
 		}
 		console.log(`Point any OpenAI-compatible client at ${proxy.url}/v1`);
+		if (proxy.uiEnabled) {
+			console.log(`Inspector UI: ${proxy.url}/ui`);
+			if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
+				console.warn("Warning: the inspector shows full prompts and responses and has no login. Do not expose it beyond trusted networks.");
+			}
+		}
 		const shutdown = async (): Promise<void> => {
 			await proxy.close();
 			process.exit(0);

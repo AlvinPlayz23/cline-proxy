@@ -120,9 +120,41 @@ console.log(completion.choices[0]?.message.content);
   SSE `chat.completion.chunk` events ending with `data: [DONE]`
   (streaming; `stream_options.include_usage` honored)
 - `GET /health` (or `/`) → `{ status, service, models, defaultModel, settingsPath }`
+- `GET /ui` → the web inspector (see below)
 
 Per-request `max_tokens`/`max_completion_tokens`/`temperature` override the
 stored Cline settings for that call only.
+
+## Web inspector
+
+Open `http://127.0.0.1:18789/ui` while the proxy runs. It shows, live, every
+request that passes through:
+
+- **Conversation** — system prompt, every message, declared tools, tool calls
+  and tool results, the model's reasoning, and its reply.
+- **Request** — the exact JSON body the client sent, plus what was handed to
+  the Cline provider layer.
+- **Sent** — the exact payloads written back to the client (including the SSE
+  `finish_reason: "error"` chunk and its message when a provider fails).
+- **Stream** — every chunk from the provider with timings.
+- **Meta** — status, timing, token usage, cost, client headers
+  (`Authorization`/cookies/API keys are redacted).
+
+Provider logos come from [models.dev](https://models.dev) (fetched and cached
+by the proxy; a letter avatar is used when none exists). The **Models** tab
+lists the providers/models from your Cline settings — click a model to copy its
+`providerId/model` id.
+
+```bash
+cline-proxy serve --log-limit 500          # entries kept in memory (default 200)
+cline-proxy serve --log-file ~/proxy.jsonl # also persist to JSONL (full prompts!)
+cline-proxy serve --no-ui                  # disable the inspector
+```
+
+The inspector holds full prompts and responses and has no login. It binds to
+`127.0.0.1` by default and rejects foreign `Host` headers there; if you pass
+`--host 0.0.0.0`, only do so on a trusted network (or use `--no-ui`).
+Inline base64 images are elided from the log.
 
 ## How it works
 

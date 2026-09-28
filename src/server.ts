@@ -3,10 +3,12 @@ import type { ApiHandler, ApiStreamChunk } from "@cline/llms";
 import { ProviderSettingsManager } from "@cline/core";
 import { detectClineInstall } from "./cline-detection.js";
 import { ProxyError } from "./errors.js";
+import { LogStore } from "./log-store.js";
 import { createHandlerForModel } from "./handler.js";
 import { loadModelCatalog, resolveModelRef, type ModelCatalog } from "./models.js";
 import { toOpenAIToolCall, type OpenAIToolCallOut } from "./tools-out.js";
 import { translateRequest, type ChatCompletionRequest } from "./translate.js";
+import { handleUiRequest } from "./ui-routes.js";
 
 export interface ProxyServerOptions {
 	host?: string;
@@ -15,6 +17,12 @@ export interface ProxyServerOptions {
 	dataDir?: string;
 	providersPath?: string;
 	coreVersion?: string;
+	/** Serve the request-inspector dashboard at /ui. Default true. */
+	ui?: boolean;
+	/** Max requests kept in the inspector (default 200). */
+	logLimit?: number;
+	/** Persist inspector entries to this JSONL file (contains full prompts). */
+	logFile?: string;
 }
 
 export interface ProxyServer {
@@ -22,6 +30,8 @@ export interface ProxyServer {
 	url: string;
 	catalog: ModelCatalog;
 	settingsPath: string;
+	logs: LogStore;
+	uiEnabled: boolean;
 	close: () => Promise<void>;
 }
 
@@ -64,6 +74,7 @@ interface CompletionContext {
 	manager: ProviderSettingsManager;
 	catalog: ModelCatalog;
 	coreVersion: string;
+	logs: LogStore;
 }
 
 interface StreamResult {
@@ -136,6 +147,7 @@ async function streamOnce(
 	messages: Parameters<ApiHandler["createMessage"]>[1],
 	tools: Parameters<ApiHandler["createMessage"]>[2],
 	signal: AbortSignal,
+	onChunk?: (chunk: ApiStreamChunk) => void,
 ): Promise<StreamResult> {
 	let text = "";
 	const toolCalls: OpenAIToolCallOut[] = [];
@@ -148,6 +160,7 @@ async function streamOnce(
 		if (signal.aborted) {
 			break;
 		}
+		onChunk?.(chunk);
 		if (chunk.type === "text") {
 			text += chunk.text;
 		} else if (chunk.type === "tool_calls") {
@@ -171,34 +184,61 @@ async function handleChatCompletions(
 	res: ServerResponse,
 	ctx: CompletionContext,
 ): Promise<void> {
-	let body: ChatCompletionRequest;
+	const { logs } = ctx;
+	let rawBody: string;
 	try {
-		body = JSON.parse(await readBody(req)) as ChatCompletionRequest;
+		rawBody = await readBody(req);
 	} catch (error) {
-		sendError(res, error instanceof ProxyError ? error.status : 400, "Request body must be valid JSON.");
+		const status = error instanceof ProxyError ? error.status : 400;
+		sendError(res, status, error instanceof Error ? error.message : "Could not read request body.");
 		return;
 	}
+	let parsed: ChatCompletionRequest | undefined;
+	try {
+		parsed = JSON.parse(rawBody) as ChatCompletionRequest;
+	} catch {
+		parsed = undefined;
+	}
+	const entry = logs.begin({
+		req,
+		endpoint: "/v1/chat/completions",
+		request: parsed ?? rawBody,
+		stream: parsed?.stream === true,
+		requestedModel: typeof parsed?.model === "string" ? parsed.model : undefined,
+	});
+	const reject = (status: number, message: string, code?: string): void => {
+		sendError(res, status, message, code);
+		logs.recordSent(entry, JSON.stringify({ error: { message, code } }));
+		logs.finish(entry, { status: "error", httpStatus: status, error: message });
+	};
+	if (!parsed || typeof parsed !== "object") {
+		reject(400, "Request body must be valid JSON.");
+		return;
+	}
+	const body = parsed;
 	try {
 		validateToolChoice(body);
 		validateNoLegacyFunctionCall(body);
 	} catch (error) {
-		sendError(res, error instanceof ProxyError ? error.status : 400, error instanceof Error ? error.message : "Invalid request.");
+		reject(error instanceof ProxyError ? error.status : 400, error instanceof Error ? error.message : "Invalid request.");
 		return;
 	}
 	let translated;
 	try {
 		translated = translateRequest(body);
 	} catch (error) {
-		sendError(res, 400, error instanceof Error ? error.message : "Invalid request.");
+		reject(400, error instanceof Error ? error.message : "Invalid request.");
 		return;
 	}
+	logs.patch(entry, { translated });
 	let modelRef;
 	try {
 		modelRef = resolveModelRef(body.model, ctx.catalog);
 	} catch (error) {
-		sendError(res, 404, error instanceof Error ? error.message : "Unknown model.", "model_not_found");
+		reject(404, error instanceof Error ? error.message : "Unknown model.", "model_not_found");
 		return;
 	}
+	logs.patch(entry, { providerId: modelRef.providerId, modelId: modelRef.modelId });
 
 	const controller = new AbortController();
 	const onClose = (): void => controller.abort();
@@ -213,7 +253,7 @@ async function handleChatCompletions(
 			{ coreVersion: ctx.coreVersion, signal: controller.signal },
 		);
 	} catch (error) {
-		sendError(res, 400, error instanceof Error ? error.message : "Failed to create provider handler.");
+		reject(400, error instanceof Error ? error.message : "Failed to create provider handler.");
 		return;
 	} finally {
 		req.off("close", onClose);
@@ -222,6 +262,11 @@ async function handleChatCompletions(
 	const completionId = randomId("chatcmpl");
 	const created = Math.floor(Date.now() / 1000);
 	const openAiModel = `${handlerResult.providerId}/${handlerResult.modelId}`;
+	req.on("close", () => {
+		if (entry.status === "pending" && !res.writableEnded) {
+			logs.finish(entry, { status: "aborted", error: "Client disconnected before the response completed." });
+		}
+	});
 
 	if (!body.stream) {
 		let result: StreamResult;
@@ -232,16 +277,18 @@ async function handleChatCompletions(
 				translated.messages,
 				translated.tools,
 				controller.signal,
+				(chunk) => logs.recordChunk(entry, chunk),
 			);
 		} catch (error) {
 			if (controller.signal.aborted) {
 				return;
 			}
-			sendError(res, 502, error instanceof Error ? error.message : "Provider request failed.", "provider_error");
+			reject(502, error instanceof Error ? error.message : "Provider request failed.", "provider_error");
 			return;
 		}
 		const hasTools = result.toolCalls.length > 0;
-		sendJson(res, 200, {
+		const finishReason = hasTools ? "tool_calls" : "stop";
+		const payload = JSON.stringify({
 			id: completionId,
 			object: "chat.completion",
 			created,
@@ -254,7 +301,7 @@ async function handleChatCompletions(
 						content: hasTools && !result.text ? null : result.text,
 						...(hasTools ? { tool_calls: result.toolCalls } : {}),
 					},
-					finish_reason: hasTools ? "tool_calls" : "stop",
+					finish_reason: finishReason,
 				},
 			],
 			...(result.promptTokens || result.completionTokens
@@ -268,6 +315,10 @@ async function handleChatCompletions(
 				: {}),
 			...(result.totalCost !== undefined ? { cost: result.totalCost } : {}),
 		});
+		res.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
+		res.end(payload);
+		logs.recordSent(entry, payload);
+		logs.finish(entry, { status: "ok", httpStatus: 200, finishReason });
 		return;
 	}
 
@@ -276,9 +327,11 @@ async function handleChatCompletions(
 		"cache-control": "no-cache",
 		connection: "keep-alive",
 	});
-	const sendChunk = (payload: unknown): void => {
-		res.write(`data: ${JSON.stringify(payload)}\n\n`);
+	const write = (line: string): void => {
+		res.write(`${line}\n\n`);
+		logs.recordSent(entry, line);
 	};
+	const sendChunk = (payload: unknown): void => write(`data: ${JSON.stringify(payload)}`);
 	const baseChunk = (): Record<string, unknown> => ({
 		id: completionId,
 		object: "chat.completion.chunk",
@@ -301,6 +354,7 @@ async function handleChatCompletions(
 				if (controller.signal.aborted) {
 					break;
 				}
+				logs.recordChunk(entry, chunk);
 				if (chunk.type === "text" && chunk.text) {
 					sendChunk({
 						...baseChunk(),
@@ -317,11 +371,14 @@ async function handleChatCompletions(
 		})();
 		await Promise.race([consume, clientClosed]);
 		if (controller.signal.aborted) {
+			logs.finish(entry, { status: "aborted", error: "Client disconnected before the response completed." });
 			res.destroy();
 			return;
 		}
 		await consume;
+		let finishReason: string;
 		if (failed && toolCalls.length === 0) {
+			finishReason = "error";
 			sendChunk({
 				...baseChunk(),
 				choices: [{ index: 0, delta: {}, finish_reason: "error" }],
@@ -349,10 +406,11 @@ async function handleChatCompletions(
 					],
 				});
 			});
+			finishReason = toolCalls.length > 0 ? "tool_calls" : "stop";
 			const includeUsage = body.stream_options?.include_usage === true;
 			sendChunk({
 				...baseChunk(),
-				choices: [{ index: 0, delta: {}, finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop" }],
+				choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
 				...(includeUsage && usage
 					? {
 							usage: {
@@ -364,9 +422,22 @@ async function handleChatCompletions(
 					: {}),
 			});
 		}
-		res.write("data: [DONE]\n\n");
+		write("data: [DONE]");
 		res.end();
-	} catch {
+		logs.finish(
+			entry,
+			failed && finishReason === "error"
+				? { status: "error", httpStatus: 200, error: failed, finishReason }
+				: { status: "ok", httpStatus: 200, finishReason },
+		);
+	} catch (error) {
+		if (entry.status === "pending") {
+			logs.finish(entry, {
+				status: "error",
+				httpStatus: 200,
+				error: error instanceof Error ? error.message : "Stream failed.",
+			});
+		}
 		if (!res.writableEnded) {
 			res.destroy();
 		}
@@ -393,7 +464,10 @@ export async function startProxyServer(options: ProxyServerOptions = {}): Promis
 		);
 	}
 	const coreVersion = options.coreVersion ?? CORE_VERSION;
-	const ctx: CompletionContext = { manager, catalog, coreVersion };
+	const logs = new LogStore({ limit: options.logLimit, filePath: options.logFile });
+	const uiEnabled = options.ui !== false;
+	const host = options.host ?? "127.0.0.1";
+	const ctx: CompletionContext = { manager, catalog, coreVersion, logs };
 
 	const server = createServer((req, res) => {
 		void (async (): Promise<void> => {
@@ -405,6 +479,14 @@ export async function startProxyServer(options: ProxyServerOptions = {}): Promis
 				}
 				if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
 					await handleChatCompletions(req, res, ctx);
+					return;
+				}
+				if (uiEnabled && (await handleUiRequest(req, res, url, { logs, catalog, settingsPath: install.providersPath, host }))) {
+					return;
+				}
+				if (uiEnabled && req.method === "GET" && url.pathname === "/" && (req.headers.accept ?? "").includes("text/html")) {
+					res.writeHead(302, { location: "/ui" });
+					res.end();
 					return;
 				}
 				if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -426,7 +508,6 @@ export async function startProxyServer(options: ProxyServerOptions = {}): Promis
 		})();
 	});
 
-	const host = options.host ?? "127.0.0.1";
 	const port = options.port ?? 18789;
 	await new Promise<void>((resolve, reject) => {
 		server.once("error", reject);
@@ -440,6 +521,8 @@ export async function startProxyServer(options: ProxyServerOptions = {}): Promis
 		url: `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}`,
 		catalog,
 		settingsPath: install.providersPath,
+		logs,
+		uiEnabled,
 		close: () =>
 			new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
